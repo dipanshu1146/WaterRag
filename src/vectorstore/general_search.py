@@ -211,6 +211,12 @@ def general_search(
 
 def display_name(source: str) -> str:
     """Original upload filename if a sidecar exists, else the file name."""
+    try:
+        from src.vectorstore.cloud_store import cloud_mode_enabled, original_filename_for
+        if cloud_mode_enabled():
+            return original_filename_for(source) or Path(source or "").name or "Unknown"
+    except Exception:
+        pass
     path = Path(source or "")
     sidecar = UPLOAD_METADATA_DIR / f"{path.name}.json"
     try:

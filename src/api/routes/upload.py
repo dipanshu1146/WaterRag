@@ -14,6 +14,17 @@ from src.vectorstore.search_index import (
     index_uploaded_file,
     normalize_source,
 )
+from src.vectorstore.cloud_store import (
+    cloud_mode_enabled,
+    delete_file_object,
+    delete_file_record,
+    download_file_object,
+    find_file_by_hash,
+    get_file,
+    list_files,
+    register_file,
+    upload_file_object,
+)
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
@@ -87,6 +98,7 @@ async def upload_document(file: UploadFile = File(...)):
     size = 0
     digest = hashlib.sha256()
     keep_saved_file = False
+    cloud_mode = cloud_mode_enabled()
 
     try:
         # Save the upload while calculating its hash.
@@ -105,28 +117,45 @@ async def upload_document(file: UploadFile = File(...)):
 
         uploaded_hash = digest.hexdigest()
 
-        duplicate = _find_duplicate(uploaded_hash, destination)
+        duplicate = (
+            find_file_by_hash(uploaded_hash)
+            if cloud_mode
+            else _find_duplicate(uploaded_hash, destination)
+        )
         if duplicate is not None:
             raise HTTPException(
                 status_code=409,
                 detail={
                     "message": "This file has already been uploaded.",
-                    "existing_filename": duplicate.name,
+                    "existing_filename": (
+                        duplicate["stored_filename"] if cloud_mode else duplicate.name
+                    ),
                 },
             )
 
-        _sidecar(stored_name).write_text(
-            json.dumps(
-                {
-                    "original_filename": original_name,
-                    "stored_filename": stored_name,
-                    "file_type": extension.lstrip("."),
-                    "size_bytes": size,
-                    "sha256": uploaded_hash,
-                },
-                indent=2,
+        if cloud_mode:
+            upload_file_object(destination, stored_name, file.content_type or "application/octet-stream")
+            register_file(
+                stored_filename=stored_name,
+                original_filename=original_name,
+                file_type=extension.lstrip("."),
+                size_bytes=size,
+                sha256=uploaded_hash,
+                indexed_records=0,
             )
-        )
+        else:
+            _sidecar(stored_name).write_text(
+                json.dumps(
+                    {
+                        "original_filename": original_name,
+                        "stored_filename": stored_name,
+                        "file_type": extension.lstrip("."),
+                        "size_bytes": size,
+                        "sha256": uploaded_hash,
+                    },
+                    indent=2,
+                )
+            )
         keep_saved_file = True
 
         try:
@@ -134,7 +163,11 @@ async def upload_document(file: UploadFile = File(...)):
         except UnsupportedDocumentError as exc:
             # The file has nothing we can index. Retrying the same bytes cannot
             # help, so do not keep it (and do not block a corrected re-upload).
-            _remove_file_and_sidecar(stored_name)
+            if cloud_mode:
+                delete_file_object(stored_name)
+                delete_file_record(stored_name)
+            else:
+                _remove_file_and_sidecar(stored_name)
             keep_saved_file = False
             raise HTTPException(
                 status_code=422,
@@ -159,9 +192,23 @@ async def upload_document(file: UploadFile = File(...)):
                 },
             ) from exc
 
+        if cloud_mode:
+            register_file(
+                stored_filename=stored_name,
+                original_filename=original_name,
+                file_type=extension.lstrip("."),
+                size_bytes=size,
+                sha256=uploaded_hash,
+                indexed_records=indexed_records,
+            )
+
         # Defence in depth: never report success for zero records.
         if indexed_records <= 0:
-            _remove_file_and_sidecar(stored_name)
+            if cloud_mode:
+                delete_file_object(stored_name)
+                delete_file_record(stored_name)
+            else:
+                _remove_file_and_sidecar(stored_name)
             keep_saved_file = False
             raise HTTPException(
                 status_code=422,
@@ -199,11 +246,29 @@ async def upload_document(file: UploadFile = File(...)):
         ) from exc
 
     finally:
+        if cloud_mode:
+            destination.unlink(missing_ok=True)
         await file.close()
 
 
 @router.get("")
 def list_uploaded_documents():
+    if cloud_mode_enabled():
+        try:
+            documents = [
+                {
+                    "original_filename": item["original_filename"],
+                    "stored_filename": item["stored_filename"],
+                    "size_bytes": item["size_bytes"],
+                    "indexed_records": item["indexed_records"],
+                    "status": "indexed" if item["indexed_records"] > 0 else "saved, not indexed",
+                }
+                for item in list_files()
+            ]
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not read cloud document metadata: {exc}") from exc
+        return {"documents": documents, "total": len(documents)}
+
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     METADATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -260,6 +325,27 @@ def _validated_target(stored_filename: str) -> Path:
 @router.post("/{stored_filename}/reindex")
 async def reindex_uploaded_document(stored_filename: str):
     """Re-run indexing for a saved file (e.g. after a failed attempt)."""
+    if cloud_mode_enabled():
+        record = get_file(stored_filename)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        target = UPLOAD_DIR / stored_filename
+        try:
+            download_file_object(stored_filename, target)
+            indexed_records = await run_in_threadpool(index_uploaded_file, str(target))
+            record["indexed_records"] = indexed_records
+            register_file(**record)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail={"message": "Re-indexing failed.", "error": str(exc)}) from exc
+        finally:
+            target.unlink(missing_ok=True)
+        return {
+            "message": f"File re-indexed successfully ({indexed_records} records).",
+            "stored_filename": stored_filename,
+            "status": "indexed",
+            "indexed_records": indexed_records,
+        }
+
     target = _validated_target(stored_filename)
 
     try:
@@ -285,6 +371,22 @@ async def reindex_uploaded_document(stored_filename: str):
 
 @router.delete("/{stored_filename}")
 def delete_uploaded_document(stored_filename: str):
+    if cloud_mode_enabled():
+        record = get_file(stored_filename)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        try:
+            deleted = delete_source_records(stored_filename)
+            delete_file_object(stored_filename)
+            delete_file_record(stored_filename)
+            return {
+                "message": "Document deleted.",
+                "stored_filename": stored_filename,
+                "deleted_indexed_records": deleted,
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not delete document: {exc}") from exc
+
     target = _validated_target(stored_filename)
 
     try:

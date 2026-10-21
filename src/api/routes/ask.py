@@ -1,13 +1,14 @@
 
 
 import re
+import os
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
 from pydantic import BaseModel, Field
 
-from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 
 from src.vectorstore.filter_index import (
 
@@ -23,7 +24,17 @@ from src.vectorstore.search_index import create_vectorstore
 
 router = APIRouter(prefix="/api", tags=["Question Answering"])
 
-llm = ChatOllama(model="gemma3:1b", temperature=0)
+def invoke_llm(prompt):
+    """Call the configured Groq chat model without loading a local LLM."""
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not configured on the backend.")
+    llm = ChatGroq(
+        model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+        temperature=0,
+        api_key=api_key,
+    )
+    return llm.invoke(prompt)
 
 class AskRequest(BaseModel):
 
@@ -707,7 +718,7 @@ Retrieved records:
 
 """
 
-    response = llm.invoke(prompt)
+    response = invoke_llm(prompt)
 
     return response.content.strip()
 
@@ -1646,7 +1657,7 @@ def _compose_answer(question, hits):
     )
 
     try:
-        reply = llm.invoke(prompt)
+        reply = invoke_llm(prompt)
         text = (getattr(reply, "content", reply) or "").strip()
         if text:
             return text

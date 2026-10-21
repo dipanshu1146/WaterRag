@@ -3,7 +3,6 @@ import re
 from pathlib import Path
 from collections import Counter
 
-from langchain_chroma import Chroma
 
 
 # --------------------------------------------------
@@ -226,10 +225,9 @@ def is_complying(value):
 
 def load_all_table_rows():
     """Load all indexed table rows without generating embeddings."""
-    vectorstore = Chroma(
-        collection_name=COLLECTION_NAME,
-        persist_directory=str(DB_DIR),
-    )
+    from src.vectorstore.search_index import create_vectorstore
+
+    vectorstore = create_vectorstore()
 
     collection = vectorstore._collection
     records = []

@@ -113,6 +113,8 @@ fastapi
 python-multipart        # required by FastAPI for file uploads (UploadFile)
 langchain-huggingface
 sentence-transformers   # all-MiniLM-L6-v2 embeddings
+langchain-groq         # Groq-hosted chat generation
+psycopg[binary]        # Supabase Postgres / pgvector connection
 pdfplumber
 pypdf
 openpyxl

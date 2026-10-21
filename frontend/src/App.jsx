@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 import "./App.css";
 
-const API = "http://127.0.0.1:8000";
+const API = (
+  import.meta.env.BACKEND_URL ||
+  import.meta.env.VITE_API_BASE_URL ||
+  "http://127.0.0.1:8000"
+).replace(/\/+$/, "");
 
 const examples = [
   "Show the latest outlet BOD, COD and TSS results for GRN-STP-011",
@@ -190,7 +194,7 @@ function App() {
       setResult(await response.json());
     } catch (err) {
       setError(
-        `${err.message}. Check that the backend is running on port 8000.`
+        `${err.message}. Check that the backend URL is configured and reachable.`
       );
     } finally {
       setLoading(false);

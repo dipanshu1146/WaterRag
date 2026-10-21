@@ -4,8 +4,6 @@ from src.ingestion.load_documents import load_excel_documents
 import re
 from pathlib import Path
 
-from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -15,6 +13,16 @@ COLLECTION_NAME = "wastewater_documents"
 
 
 def create_vectorstore():
+    # Hosted deployments use Supabase pgvector + Hugging Face's hosted
+    # feature-extraction endpoint. Local development retains Chroma.
+    from src.vectorstore.cloud_store import CloudVectorStore, cloud_mode_enabled
+
+    if cloud_mode_enabled():
+        return CloudVectorStore()
+
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_chroma import Chroma
+
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL
     )
@@ -92,6 +100,8 @@ def source_variants(source: str | Path) -> list[str]:
     """Every spelling a source may have been indexed under."""
     absolute = Path(normalize_source(source))
     variants = {str(absolute), str(Path(source))}
+    # Cloud uploads use the unique stored filename as a stable source key.
+    variants.add(Path(source).name)
 
     try:
         relative = absolute.relative_to(PROJECT_ROOT)
@@ -143,13 +153,22 @@ def index_uploaded_file(file_path: str | Path, vectorstore=None) -> int:
     vectorstore = vectorstore or create_vectorstore()
     file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
 
+    from src.vectorstore.cloud_store import CloudVectorStore
+    cloud_mode = isinstance(vectorstore, CloudVectorStore)
+    if cloud_mode:
+        # A stable source value survives Render restarts and maps back to the
+        # object in the private Supabase Storage bucket.
+        for chunk in chunks:
+            chunk.metadata["source"] = path.name
+            chunk.metadata["file_name"] = path.name
+
     documents, ids = [], []
     for position, chunk in enumerate(chunks):
         documents.append(Document(page_content=chunk.page_content, metadata=chunk.metadata))
         ids.append(hashlib.sha256(f"{file_hash}|{position}".encode("utf-8")).hexdigest())
 
     # Replace any earlier (possibly partial) index of this same file.
-    delete_source_records(path, vectorstore)
+    delete_source_records(path.name if cloud_mode else path, vectorstore)
 
     for start in range(0, len(documents), 500):
         vectorstore.add_documents(
