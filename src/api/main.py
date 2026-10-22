@@ -35,6 +35,7 @@ app.include_router(upload_router)
 app.include_router(ask_router)
 
 
+@app.get("/")
 @app.get("/api/health")
 def health_check():
     return {
