@@ -146,34 +146,62 @@ def index_uploaded_file(file_path: str | Path, vectorstore=None) -> int:
     success for zero records.
     """
     from src.ingestion.pipeline import ingest_file
+    from src.vectorstore.cloud_store import CloudVectorStore
 
     path = Path(file_path).resolve()
-    chunks = ingest_file(path)  # raises on unsupported / empty
-
     vectorstore = vectorstore or create_vectorstore()
-    file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-
-    from src.vectorstore.cloud_store import CloudVectorStore
     cloud_mode = isinstance(vectorstore, CloudVectorStore)
+
+    digest = hashlib.sha256()
+    with path.open("rb") as source_file:
+        for block in iter(lambda: source_file.read(1024 * 1024), b""):
+            digest.update(block)
+    file_hash = digest.hexdigest()
+
     if cloud_mode:
-        # A stable source value survives Render restarts and maps back to the
-        # object in the private Supabase Storage bucket.
-        for chunk in chunks:
+        # Cloud PDFs are parsed one page at a time and embedded in small batches
+        # so Render's 512 MB free instance does not hold the whole PDF index.
+        from src.ingestion.pipeline import iter_pdf_chunks, UnsupportedDocumentError
+
+        chunk_stream = (
+            iter_pdf_chunks(path)
+            if path.suffix.lower() == ".pdf"
+            else iter(ingest_file(path))
+        )
+        delete_source_records(path.name, vectorstore)
+        inserted = 0
+        documents, ids = [], []
+
+        def flush_batch():
+            nonlocal inserted, documents, ids
+            if documents:
+                vectorstore.add_documents(documents=documents, ids=ids)
+                inserted += len(documents)
+                documents, ids = [], []
+
+        for position, chunk in enumerate(chunk_stream):
             chunk.metadata["source"] = path.name
             chunk.metadata["file_name"] = path.name
+            documents.append(Document(page_content=chunk.page_content, metadata=chunk.metadata))
+            ids.append(hashlib.sha256(f"{file_hash}|{position}".encode("utf-8")).hexdigest())
+            if len(documents) >= 12:
+                flush_batch()
+        flush_batch()
+        if inserted == 0:
+            raise UnsupportedDocumentError(f"No readable content was found in {path.name}.")
+        return inserted
 
+    chunks = ingest_file(path)  # raises on unsupported / empty
     documents, ids = [], []
     for position, chunk in enumerate(chunks):
         documents.append(Document(page_content=chunk.page_content, metadata=chunk.metadata))
         ids.append(hashlib.sha256(f"{file_hash}|{position}".encode("utf-8")).hexdigest())
 
-    # Replace any earlier (possibly partial) index of this same file.
-    delete_source_records(path.name if cloud_mode else path, vectorstore)
-
-    for start in range(0, len(documents), 500):
+    delete_source_records(path, vectorstore)
+    for start in range(0, len(documents), 32):
         vectorstore.add_documents(
-            documents=documents[start:start + 500],
-            ids=ids[start:start + 500],
+            documents=documents[start:start + 32],
+            ids=ids[start:start + 32],
         )
 
     return len(documents)

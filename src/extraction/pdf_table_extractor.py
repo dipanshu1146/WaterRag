@@ -89,6 +89,70 @@ def reconstruct_ghaggar_table(rows: list[list]) -> tuple[list[str], list[list[st
     return headers, data
 
 
+def extract_page_tables(
+    page,
+    file_path: str | Path,
+    page_number: int,
+    table_objects=None,
+) -> list[dict]:
+    """Extract one page's tables so hosted indexing can release page memory."""
+    path = Path(file_path)
+    extracted_tables = []
+
+    tables = (
+        [table_object.extract() for table_object in table_objects]
+        if table_objects is not None
+        else page.extract_tables()
+    )
+    for table_number, table in enumerate(tables, start=1):
+        if not table:
+            continue
+
+        raw_rows = [
+            [str(cell).strip() if cell is not None else "" for cell in row]
+            for row in table
+        ]
+        raw_rows = [row for row in raw_rows if any(clean_cell(cell) for cell in row)]
+
+        if not raw_rows:
+            continue
+
+        # Special handling only for the malformed Ghaggar table.
+        if is_ghaggar_under_construction_table(raw_rows):
+            headers, data_rows = reconstruct_ghaggar_table(raw_rows)
+        else:
+            headers = [clean_cell(cell.replace("\n", " ")) for cell in raw_rows[0]]
+            data_rows = []
+
+            for row in raw_rows[1:]:
+                cleaned = [clean_cell(cell) for cell in row]
+
+                if cleaned == headers:
+                    continue
+
+                # Skip standalone section headings.
+                if (
+                    cleaned[0]
+                    and not cleaned[0].rstrip(".").isdigit()
+                    and not any(cleaned[1:])
+                ):
+                    continue
+
+                data_rows.append(cleaned)
+
+        extracted_tables.append({
+            "source": path.name,
+            "file_type": "pdf",
+            "page": page_number,
+            "table_number": table_number,
+            "content_type": "table",
+            "headers": headers,
+            "rows": data_rows,
+        })
+
+    return extracted_tables
+
+
 def extract_pdf_tables(file_path: str | Path) -> list[dict]:
     """Extract PDF tables while retaining page and table metadata."""
     path = Path(file_path)
@@ -96,61 +160,6 @@ def extract_pdf_tables(file_path: str | Path) -> list[dict]:
 
     with pdfplumber.open(path) as pdf:
         for page_number, page in enumerate(pdf.pages, start=1):
-            for table_number, table in enumerate(
-                page.extract_tables(), start=1
-            ):
-                if not table:
-                    continue
-
-                raw_rows = [
-                    [
-                        str(cell).strip() if cell is not None else ""
-                        for cell in row
-                    ]
-                    for row in table
-                ]
-                raw_rows = [
-                    row for row in raw_rows
-                    if any(clean_cell(cell) for cell in row)
-                ]
-
-                if not raw_rows:
-                    continue
-
-                # Special handling only for the malformed Ghaggar table.
-                if is_ghaggar_under_construction_table(raw_rows):
-                    headers, data_rows = reconstruct_ghaggar_table(raw_rows)
-                else:
-                    headers = [
-                        clean_cell(cell.replace("\n", " "))
-                        for cell in raw_rows[0]
-                    ]
-                    data_rows = []
-
-                    for row in raw_rows[1:]:
-                        cleaned = [clean_cell(cell) for cell in row]
-
-                        if cleaned == headers:
-                            continue
-
-                        # Skip standalone section headings.
-                        if (
-                            cleaned[0]
-                            and not cleaned[0].rstrip(".").isdigit()
-                            and not any(cleaned[1:])
-                        ):
-                            continue
-
-                        data_rows.append(cleaned)
-
-                extracted_tables.append({
-                    "source": path.name,
-                    "file_type": "pdf",
-                    "page": page_number,
-                    "table_number": table_number,
-                    "content_type": "table",
-                    "headers": headers,
-                    "rows": data_rows,
-                })
+            extracted_tables.extend(extract_page_tables(page, path, page_number))
 
     return extracted_tables

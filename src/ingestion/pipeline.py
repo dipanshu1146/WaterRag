@@ -410,6 +410,96 @@ def extract_pdf(path: Path) -> list[Chunk]:
     return records or _ocr_pdf(path)
 
 
+def iter_pdf_chunks(path: str | Path):
+    """Yield normalized PDF chunks one page at a time for memory-limited hosts."""
+    import pdfplumber
+
+    from src.extraction.pdf_table_extractor import (
+        extract_page_tables,
+    )
+    from src.extraction.table_to_text import table_rows_to_text
+
+    path = Path(path).resolve()
+    counters: dict[tuple, int] = {}
+    found_content = False
+
+    def emit(record: Chunk):
+        for part in split_text(record.page_content):
+            metadata = {}
+            for key, value in record.metadata.items():
+                if value is not None:
+                    metadata[key] = (
+                        value if isinstance(value, (str, int, float, bool)) else str(value)
+                    )
+            metadata["source"] = str(path)
+            metadata["file_name"] = path.name
+            metadata.setdefault("content_type", "text")
+            group = (
+                metadata.get("content_type"), metadata.get("page"),
+                metadata.get("sheet"), metadata.get("table_number"),
+                metadata.get("row_number"),
+            )
+            metadata["chunk_index"] = counters.get(group, 0)
+            counters[group] = metadata["chunk_index"] + 1
+            yield Chunk(part, metadata)
+
+    with pdfplumber.open(path) as pdf:
+        for page_number, page in enumerate(pdf.pages, start=1):
+            try:
+                page_records = []
+                tables_on_page = page.find_tables()
+
+                def outside_tables(obj):
+                    if obj.get("object_type") != "char":
+                        return True
+                    for table in tables_on_page:
+                        x0, top, x1, bottom = table.bbox
+                        if (
+                            obj["x0"] >= x0 and obj["x1"] <= x1
+                            and obj["top"] >= top and obj["bottom"] <= bottom
+                        ):
+                            return False
+                    return True
+
+                narrative_page = page.filter(outside_tables)
+                text = narrative_page.extract_text() or ""
+                if text.strip():
+                    page_records.append(Chunk(text, {
+                        "file_type": "pdf", "content_type": "text", "page": page_number,
+                    }))
+
+                for table in extract_page_tables(
+                    page, path, page_number, table_objects=tables_on_page
+                ):
+                    for record in table_rows_to_text(table):
+                        metadata = dict(record)
+                        if (
+                            metadata.get("content_type") == "table_row"
+                            and not STP_SCHEMA_RE.search(record["content"])
+                        ):
+                            metadata["content_type"] = "table_record"
+                        page_records.append(Chunk(record["content"], metadata))
+
+                for record in page_records:
+                    for chunk in emit(record):
+                        found_content = True
+                        yield chunk
+            finally:
+                page.close()
+
+    if not found_content:
+        for record in _ocr_pdf(path):
+            for chunk in emit(record):
+                found_content = True
+                yield chunk
+
+    if not found_content:
+        raise UnsupportedDocumentError(
+            f"No readable content was found in {path.name}. It may be a scanned PDF "
+            "without a text layer; OCR (pytesseract + the Tesseract program) is required for scans."
+        )
+
+
 EXTRACTORS = {
     ".txt": extract_txt,
     ".csv": extract_csv,

@@ -9,16 +9,18 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from urllib.parse import quote
-
 import psycopg
 import requests
 from langchain_core.documents import Document
 from psycopg.types.json import Jsonb
 
 
-VECTOR_DIMENSIONS = 384  # sentence-transformers/all-MiniLM-L6-v2
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+VECTOR_DIMENSIONS = 384  # Matches the existing Supabase pgvector column.
+DEFAULT_EMBEDDING_MODEL = "gemini-embedding-2"
+GEMINI_EMBEDDING_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{DEFAULT_EMBEDDING_MODEL}:batchEmbedContents"
+)
 _SCHEMA_READY = False
 
 
@@ -81,59 +83,55 @@ def _vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(f"{float(value):.8f}" for value in vector) + "]"
 
 
-def _normalise_embedding(value) -> list[float]:
-    """Convert HF feature-extraction output into one 384-value vector."""
-    import numpy as np
-
-    array = np.asarray(value, dtype=np.float32)
-    if array.ndim == 3:
-        array = array.mean(axis=1)
-    if array.ndim == 2:
-        array = array.mean(axis=0)
-    if array.ndim != 1 or array.shape[0] != VECTOR_DIMENSIONS:
+def _embedding_values(payload: dict) -> list[float]:
+    values = payload.get("values") if isinstance(payload, dict) else None
+    if not isinstance(values, list) or len(values) != VECTOR_DIMENSIONS:
+        actual = len(values) if isinstance(values, list) else "missing"
         raise RuntimeError(
-            f"Embedding model returned shape {array.shape}; expected "
-            f"{VECTOR_DIMENSIONS} values. Confirm HF_EMBEDDING_MODEL is "
-            "sentence-transformers/all-MiniLM-L6-v2."
+            f"Gemini embedding returned {actual} values; expected "
+            f"{VECTOR_DIMENSIONS}."
         )
-    norm = float(np.linalg.norm(array))
-    if norm:
-        array = array / norm
-    return array.tolist()
+    return [float(value) for value in values]
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Request remote vectors from Hugging Face Inference Providers."""
-    token = os.getenv("HF_TOKEN", "").strip()
+def embed_texts(texts: list[str], input_type: str = "document") -> list[list[float]]:
+    """Request low-dimensional remote vectors from Gemini Embedding 2."""
+    token = os.getenv("GEMINI_API_KEY", "").strip()
     if not token:
-        raise RuntimeError("HF_TOKEN is required for hosted embeddings.")
-    model = os.getenv("HF_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL).strip()
-    endpoint = (
-        "https://router.huggingface.co/hf-inference/models/"
-        f"{quote(model, safe='/')}/pipeline/feature-extraction"
-    )
+        raise RuntimeError("GEMINI_API_KEY is required for hosted embeddings on Render.")
     vectors: list[list[float]] = []
-    # Batches keep ingestion request counts down while staying modest for the
-    # free inference allowance and hosted endpoint payload limits.
-    for start in range(0, len(texts), 16):
-        batch = texts[start:start + 16]
+    # Small batches limit both request size and memory use on Render's free tier.
+    for start in range(0, len(texts), 12):
+        batch = texts[start:start + 12]
+        if input_type == "query":
+            prepared = [f"task: question answering | query: {text}" for text in batch]
+        else:
+            prepared = [f"title: none | text: {text}" for text in batch]
         response = requests.post(
-            endpoint,
-            headers={"Authorization": f"Bearer {token}"},
-            json={"inputs": batch, "normalize": True, "truncate": True},
+            GEMINI_EMBEDDING_URL,
+            headers={"x-goog-api-key": token},
+            json={
+                "requests": [
+                    {
+                        "model": f"models/{DEFAULT_EMBEDDING_MODEL}",
+                        "content": {"parts": [{"text": text}]},
+                        "outputDimensionality": VECTOR_DIMENSIONS,
+                    }
+                    for text in prepared
+                ]
+            },
             timeout=90,
         )
         if response.status_code >= 400:
             raise RuntimeError(
-                f"Hugging Face embedding request failed ({response.status_code}): "
+                f"Gemini embedding request failed ({response.status_code}): "
                 f"{response.text[:500]}"
             )
         payload = response.json()
-        if len(batch) == 1 and payload and isinstance(payload[0], (int, float)):
-            payload = [payload]
-        if not isinstance(payload, list) or len(payload) != len(batch):
-            raise RuntimeError("Hugging Face returned an unexpected embedding response.")
-        vectors.extend(_normalise_embedding(item) for item in payload)
+        embeddings = payload.get("embeddings") if isinstance(payload, dict) else None
+        if not isinstance(embeddings, list) or len(embeddings) != len(batch):
+            raise RuntimeError("Gemini returned an unexpected embedding response.")
+        vectors.extend(_embedding_values(item) for item in embeddings)
     return vectors
 
 
@@ -218,7 +216,9 @@ class CloudVectorStore:
     def add_documents(self, documents, ids):
         if not documents:
             return
-        vectors = embed_texts([document.page_content for document in documents])
+        vectors = embed_texts(
+            [document.page_content for document in documents], input_type="document"
+        )
         rows = [
             (document_id, document.page_content, Jsonb(document.metadata), _vector_literal(vector))
             for document_id, document, vector in zip(ids, documents, vectors)
@@ -233,7 +233,7 @@ class CloudVectorStore:
             )
 
     def similarity_search_with_score(self, query, k=5, filter=None):
-        vector = _vector_literal(embed_texts([query])[0])
+        vector = _vector_literal(embed_texts([query], input_type="query")[0])
         clause, params = _filter_sql(filter)
         sql = "SELECT content, metadata, embedding <=> %s::vector AS distance FROM rag_documents"
         params.insert(0, vector)
