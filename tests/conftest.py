@@ -130,7 +130,7 @@ def store(monkeypatch, tmp_path):
     monkeypatch.setattr(upload, "UPLOAD_DIR", uploads)
     monkeypatch.setattr(upload, "METADATA_DIR", metadata)
     monkeypatch.setattr(general_search, "UPLOAD_METADATA_DIR", metadata)
-    monkeypatch.setattr(ask, "llm", _FailingLLM())
+    monkeypatch.setattr(ask, "invoke_llm", lambda prompt: _FailingLLM().invoke(prompt))
     monkeypatch.setattr(ask, "load_all_table_rows", lambda: [])
     # Bulk-indexed relative sources resolve against the project root.
     return fake

@@ -36,6 +36,13 @@ app.include_router(ask_router)
 
 
 @app.get("/")
+def health_check():
+    return {
+        "status": "healthy",
+        "application": "Wastewater RAG",
+        "message": "Backend is running successfully.",
+    }
+
 @app.get("/api/health")
 def health_check():
     return {

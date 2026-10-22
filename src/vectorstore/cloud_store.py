@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import quote
+
 import psycopg
 import requests
 from langchain_core.documents import Document
@@ -16,11 +18,8 @@ from psycopg.types.json import Jsonb
 
 
 VECTOR_DIMENSIONS = 384  # Matches the existing Supabase pgvector column.
-DEFAULT_EMBEDDING_MODEL = "gemini-embedding-2"
-GEMINI_EMBEDDING_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{DEFAULT_EMBEDDING_MODEL}:batchEmbedContents"
-)
+DEFAULT_EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5"
+CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 _SCHEMA_READY = False
 
 
@@ -83,54 +82,63 @@ def _vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(f"{float(value):.8f}" for value in vector) + "]"
 
 
-def _embedding_values(payload: dict) -> list[float]:
-    values = payload.get("values") if isinstance(payload, dict) else None
+def _cloudflare_embedding_config() -> tuple[str, str]:
+    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+    if not account_id or not token:
+        raise RuntimeError(
+            "CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required "
+            "for hosted embeddings."
+        )
+    return account_id, token
+
+
+def _embedding_values(values) -> list[float]:
     if not isinstance(values, list) or len(values) != VECTOR_DIMENSIONS:
         actual = len(values) if isinstance(values, list) else "missing"
         raise RuntimeError(
-            f"Gemini embedding returned {actual} values; expected "
+            f"Cloudflare embedding returned {actual} values; expected "
             f"{VECTOR_DIMENSIONS}."
         )
     return [float(value) for value in values]
 
 
 def embed_texts(texts: list[str], input_type: str = "document") -> list[list[float]]:
-    """Request low-dimensional remote vectors from Gemini Embedding 2."""
-    token = os.getenv("GEMINI_API_KEY", "").strip()
-    if not token:
-        raise RuntimeError("GEMINI_API_KEY is required for hosted embeddings on Render.")
+    """Request 384-dimensional remote vectors from Cloudflare Workers AI."""
+    if not texts:
+        return []
+    account_id, token = _cloudflare_embedding_config()
+    endpoint = (
+        f"{CLOUDFLARE_API_BASE}/{quote(account_id, safe='')}/ai/run/"
+        f"{DEFAULT_EMBEDDING_MODEL}"
+    )
     vectors: list[list[float]] = []
-    # Small batches limit both request size and memory use on Render's free tier.
+    # Small batches limit request size and memory use on Render's free tier.
     for start in range(0, len(texts), 12):
         batch = texts[start:start + 12]
         if input_type == "query":
-            prepared = [f"task: question answering | query: {text}" for text in batch]
+            prepared = [
+                f"Represent this sentence for searching relevant passages: {text}"
+                for text in batch
+            ]
         else:
-            prepared = [f"title: none | text: {text}" for text in batch]
+            prepared = batch
         response = requests.post(
-            GEMINI_EMBEDDING_URL,
-            headers={"x-goog-api-key": token},
-            json={
-                "requests": [
-                    {
-                        "model": f"models/{DEFAULT_EMBEDDING_MODEL}",
-                        "content": {"parts": [{"text": text}]},
-                        "outputDimensionality": VECTOR_DIMENSIONS,
-                    }
-                    for text in prepared
-                ]
-            },
+            endpoint,
+            headers={"Authorization": f"Bearer {token}"},
+            json={"text": prepared},
             timeout=90,
         )
         if response.status_code >= 400:
             raise RuntimeError(
-                f"Gemini embedding request failed ({response.status_code}): "
+                f"Cloudflare embedding request failed ({response.status_code}): "
                 f"{response.text[:500]}"
             )
         payload = response.json()
-        embeddings = payload.get("embeddings") if isinstance(payload, dict) else None
+        result = payload.get("result") if isinstance(payload, dict) else None
+        embeddings = result.get("data") if isinstance(result, dict) else None
         if not isinstance(embeddings, list) or len(embeddings) != len(batch):
-            raise RuntimeError("Gemini returned an unexpected embedding response.")
+            raise RuntimeError("Cloudflare returned an unexpected embedding response.")
         vectors.extend(_embedding_values(item) for item in embeddings)
     return vectors
 
@@ -224,13 +232,14 @@ class CloudVectorStore:
             for document_id, document, vector in zip(ids, documents, vectors)
         ]
         with psycopg.connect(_database_url(), connect_timeout=15) as connection:
-            connection.executemany(
-                """INSERT INTO rag_documents (id, content, metadata, embedding)
-                   VALUES (%s, %s, %s, %s::vector)
-                   ON CONFLICT (id) DO UPDATE SET content=EXCLUDED.content,
-                     metadata=EXCLUDED.metadata, embedding=EXCLUDED.embedding""",
-                rows,
-            )
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    """INSERT INTO rag_documents (id, content, metadata, embedding)
+                       VALUES (%s, %s, %s, %s::vector)
+                       ON CONFLICT (id) DO UPDATE SET content=EXCLUDED.content,
+                         metadata=EXCLUDED.metadata, embedding=EXCLUDED.embedding""",
+                    rows,
+                )
 
     def similarity_search_with_score(self, query, k=5, filter=None):
         vector = _vector_literal(embed_texts([query], input_type="query")[0])

@@ -1,0 +1,26 @@
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Local Python environments and generated files
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Frontend dependencies
+frontend/node_modules/
+
+# Uploaded documents and local vector indexes
+data/uploads/
+data/chroma_db/
+data/vector_db/
+
+
+CHANGES.md
